@@ -9,6 +9,8 @@ App.setColorWorkTreeByUsageFlag(False)
 App.clearTerminal()
 doc = App.caeDocument()
 
+scale = 1000.0 # for mm
+
 # geometry ID
 geom_id = 1
 
@@ -25,7 +27,7 @@ with open(fname, 'r') as f:
 	for line in f.read().splitlines():
 		tok = line.split('\t')
 		x, y, typ = float(tok[3]), float(tok[4]), int(tok[15])
-		isol_coords.append((x, y))
+		isol_coords.append((x*scale, y*scale))
 		isol_types.append(typ)
 
 isol_coords = np.array(isol_coords)
@@ -35,7 +37,7 @@ isol_types = np.array(isol_types)
 tree = cKDTree(isol_coords)
 
 # tolerance in model units (e.g. meters or whatever your model uses)
-tol = 0.1   # adjust as needed
+tol = 0.1*scale   # adjust as needed
 
 # --- create selection sets ---
 sset_map = {}
@@ -60,7 +62,6 @@ for edge_id in sset_all_iso.geometries[1].edges:
 	vertices = geom.shape.getSubshapeChildren(edge_id, MpcSubshapeType.Edge, MpcSubshapeType.Vertex)
 	p = geom.shape.vertexPosition(vertices[0])
 	query_point = np.array([[p.x, p.y]])
-
 	# find closest isol point
 	dist, idx = tree.query(query_point)
 	if dist[0] <= tol:

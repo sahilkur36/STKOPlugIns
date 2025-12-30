@@ -38,6 +38,23 @@ class _interaction_map_item:
     def __init__(self, interaction:MpcInteraction):
         self.interaction = interaction
 
+# utility to split list with duplicates in sub-lists without duplicates,
+# preserving the total number of items of the input list
+def _split_no_duplicates(lst):
+    if not lst:
+        return []
+    from collections import Counter
+    counts = Counter(lst)
+    # Number of output lists = maximum frequency of any item
+    max_count = max(counts.values())
+    # Prepare empty lists
+    result = [[] for _ in range(max_count)]
+    # Distribute each value across the lists
+    for value, freq in counts.items():
+        for i in range(freq):
+            result[i].append(value)
+    return result
+
 # this class is used to build the geometry of the model
 # it uses the MIDAS document to build the STKO document
 class builder:
@@ -1086,21 +1103,141 @@ class builder:
                 
     # builds the nodal loads in STKO
     def _build_nodal_loads(self, lc:load_case):
-        for node_load, node_ids in lc.nodal_loads.items():
-            F = Math.vec3(*node_load.value[:3])
-            M = Math.vec3(*node_load.value[3:])
-            for load_vec, meta_name, label in zip((F, M), ('NodeForce', 'NodeCouple'), ('F', 'M')):
-                # skip null
-                if load_vec.norm() < 1.0e-10:
-                    continue
+        for node_load, node_ids_temp in lc.nodal_loads.items():
+            node_ids_LIST = _split_no_duplicates(node_ids_temp)
+            for node_ids in node_ids_LIST:
+                F = Math.vec3(*node_load.value[:3])
+                M = Math.vec3(*node_load.value[3:])
+                for load_vec, meta_name, label in zip((F, M), ('NodeForce', 'NodeCouple'), ('F', 'M')):
+                    # skip null
+                    if load_vec.norm() < 1.0e-10:
+                        continue
+                    # create a new condition
+                    condition = MpcCondition()
+                    condition.id = self.stko.new_condition_id()
+                    condition.name = f'{meta_name} {node_load}'
+                    # define xobject
+                    meta = self.stko.doc.metaDataCondition(f'Loads.Force.{meta_name}')
+                    xobj = MpcXObject.createInstanceOf(meta)
+                    xobj.getAttribute(label).quantityVector3.value = load_vec
+                    condition.XObject = xobj
+                    # add the assigned nodes to the condition
+                    geom_node_map : DefaultDict[MpcGeometry, List[int]] = defaultdict(list)
+                    for i in node_ids:
+                        # get the geometry and subshape id
+                        vertex_data = self._vertex_map.get(i, None)
+                        if vertex_data is None:
+                            raise Exception(f'Vertex {i} not found in geometry')
+                        geom_node_map[vertex_data.geom].append(vertex_data.subshape_id)
+                    for geom, vertices in geom_node_map.items():
+                        sset = MpcConditionIndexedSubSet()
+                        for iv in vertices:
+                            sset.vertices.append(iv)
+                        condition.assignTo(geom, sset)
+                    # add the condition to the document
+                    self.stko.add_condition(condition)
+                    condition.commitXObjectChanges()
+                    # track the load id for the load pattern
+                    self._pattern_load_ids[lc.name].append(condition.id)
+
+    # builds the beam loads in STKO
+    def _build_beam_loads(self, lc:load_case):
+        for ele_load, ele_ids_temp in lc.beam_loads.items():
+            ele_ids_LIST = _split_no_duplicates(ele_ids_temp)
+            for ele_ids in ele_ids_LIST:
                 # create a new condition
                 condition = MpcCondition()
                 condition.id = self.stko.new_condition_id()
-                condition.name = f'{meta_name} {node_load}'
+                condition.name = f'Beam Load ({ele_load.value[0]:.2g} {ele_load.value[1]:.2g} {ele_load.value[2]:.2g})'
                 # define xobject
-                meta = self.stko.doc.metaDataCondition(f'Loads.Force.{meta_name}')
+                meta = self.stko.doc.metaDataCondition('Loads.eleLoad.eleLoad_beamUniform')
                 xobj = MpcXObject.createInstanceOf(meta)
-                xobj.getAttribute(label).quantityVector3.value = load_vec
+                xobj.getAttribute('Dimension').string = '3D'
+                xobj.getAttribute('2D').boolean = False
+                xobj.getAttribute('3D').boolean = True
+                xobj.getAttribute('use_Wx').boolean = True
+                xobj.getAttribute('Wx').real = ele_load.value[0]
+                xobj.getAttribute('Wy').real = ele_load.value[1]
+                xobj.getAttribute('Wz').real = ele_load.value[2]
+                if ele_load.local:
+                    xobj.getAttribute('Orientation').string = 'Local'
+                    xobj.getAttribute('Global').boolean = False
+                else:
+                    xobj.getAttribute('Orientation').string = 'Global'
+                    xobj.getAttribute('Global').boolean = True
+                condition.XObject = xobj
+                # add the assigned elements to the condition
+                geom_ele_map : DefaultDict[MpcGeometry, List[int]] = defaultdict(list)
+                for i in ele_ids:
+                    # get the geometry and subshape id
+                    frame_data = self._frame_map.get(i, None)
+                    if frame_data is None:
+                        raise Exception(f'Frame {i} not found in geometry')
+                    geom_ele_map[frame_data.geom].append(frame_data.subshape_id)
+                for geom, edges in geom_ele_map.items():
+                    sset = MpcConditionIndexedSubSet()
+                    for ie in edges:
+                        sset.edges.append(ie)
+                    condition.assignTo(geom, sset)
+                # add the condition to the document
+                self.stko.add_condition(condition)
+                condition.commitXObjectChanges()
+                # track the load id for the load pattern
+                self._pattern_eleload_ids[lc.name].append(condition.id)
+
+    # builds the pressure loads in STKO
+    def _build_pressure_loads(self, lc:load_case):
+        for press, ele_ids_temp in lc.pressure_loads.items():
+            ele_ids_LIST = _split_no_duplicates(ele_ids_temp)
+            for ele_ids in ele_ids_LIST:
+                # create a new condition
+                condition = MpcCondition()
+                condition.id = self.stko.new_condition_id()
+                condition.name = f'Pressure Load ({press.value[0]:.2g}, {press.value[1]:.2g}, {press.value[2]:.2g})'
+                # define xobject
+                meta = self.stko.doc.metaDataCondition('Loads.Force.FaceForce')
+                xobj = MpcXObject.createInstanceOf(meta)
+                if press.local:
+                    xobj.getAttribute('Orientation').string = 'Local'
+                    xobj.getAttribute('Global').boolean = False
+                else:
+                    xobj.getAttribute('Orientation').string = 'Global'
+                    xobj.getAttribute('Global').boolean = True
+                xobj.getAttribute('F').quantityVector3.value = Math.vec3(*press.value[:3])
+                condition.XObject = xobj
+                # add the assigned elements to the condition
+                geom_ele_map : DefaultDict[MpcGeometry, List[int]] = defaultdict(list)
+                for i in ele_ids:
+                    # get the geometry and subshape id
+                    area_data = self._area_map.get(i, None)
+                    if area_data is None:
+                        raise Exception(f'Area {i} not found in geometry')
+                    geom_ele_map[area_data.geom].append(area_data.subshape_id)
+                for geom, faces in geom_ele_map.items():
+                    sset = MpcConditionIndexedSubSet()
+                    for ie in faces:
+                        sset.faces.append(ie)
+                    condition.assignTo(geom, sset)
+                # add the condition to the document
+                self.stko.add_condition(condition)
+                condition.commitXObjectChanges()
+                # track the load id for the load pattern
+                self._pattern_load_ids[lc.name].append(condition.id)
+
+    # builds the floor loads in STKO
+    def _build_floor_loads(self, lc:load_case):
+        # build floor load as NodeForce (not Moments)
+        for floor_load, node_ids_temp in lc.floor_loads.items():
+            node_ids_LIST = _split_no_duplicates(node_ids_temp)
+            for node_ids in node_ids_LIST:
+                # create a new condition
+                condition = MpcCondition()
+                condition.id = self.stko.new_condition_id()
+                condition.name = f'Floor Load ({floor_load.value[0]:.2g}, {floor_load.value[1]:.2g}, {floor_load.value[2]:.2g})'
+                # define xobject
+                meta = self.stko.doc.metaDataCondition('Loads.Force.NodeForce')
+                xobj = MpcXObject.createInstanceOf(meta)
+                xobj.getAttribute('F').quantityVector3.value = Math.vec3(*floor_load.value)
                 condition.XObject = xobj
                 # add the assigned nodes to the condition
                 geom_node_map : DefaultDict[MpcGeometry, List[int]] = defaultdict(list)
@@ -1120,118 +1257,6 @@ class builder:
                 condition.commitXObjectChanges()
                 # track the load id for the load pattern
                 self._pattern_load_ids[lc.name].append(condition.id)
-
-    # builds the beam loads in STKO
-    def _build_beam_loads(self, lc:load_case):
-        for ele_load, ele_ids in lc.beam_loads.items():
-            # create a new condition
-            condition = MpcCondition()
-            condition.id = self.stko.new_condition_id()
-            condition.name = f'Beam Load ({ele_load.value[0]:.2g} {ele_load.value[1]:.2g} {ele_load.value[2]:.2g})'
-            # define xobject
-            meta = self.stko.doc.metaDataCondition('Loads.eleLoad.eleLoad_beamUniform')
-            xobj = MpcXObject.createInstanceOf(meta)
-            xobj.getAttribute('Dimension').string = '3D'
-            xobj.getAttribute('2D').boolean = False
-            xobj.getAttribute('3D').boolean = True
-            xobj.getAttribute('use_Wx').boolean = True
-            xobj.getAttribute('Wx').real = ele_load.value[0]
-            xobj.getAttribute('Wy').real = ele_load.value[1]
-            xobj.getAttribute('Wz').real = ele_load.value[2]
-            if ele_load.local:
-                xobj.getAttribute('Orientation').string = 'Local'
-                xobj.getAttribute('Global').boolean = False
-            else:
-                xobj.getAttribute('Orientation').string = 'Global'
-                xobj.getAttribute('Global').boolean = True
-            condition.XObject = xobj
-            # add the assigned elements to the condition
-            geom_ele_map : DefaultDict[MpcGeometry, List[int]] = defaultdict(list)
-            for i in ele_ids:
-                # get the geometry and subshape id
-                frame_data = self._frame_map.get(i, None)
-                if frame_data is None:
-                    raise Exception(f'Frame {i} not found in geometry')
-                geom_ele_map[frame_data.geom].append(frame_data.subshape_id)
-            for geom, edges in geom_ele_map.items():
-                sset = MpcConditionIndexedSubSet()
-                for ie in edges:
-                    sset.edges.append(ie)
-                condition.assignTo(geom, sset)
-            # add the condition to the document
-            self.stko.add_condition(condition)
-            condition.commitXObjectChanges()
-            # track the load id for the load pattern
-            self._pattern_eleload_ids[lc.name].append(condition.id)
-
-    # builds the pressure loads in STKO
-    def _build_pressure_loads(self, lc:load_case):
-        for press, ele_ids in lc.pressure_loads.items():
-            # create a new condition
-            condition = MpcCondition()
-            condition.id = self.stko.new_condition_id()
-            condition.name = f'Pressure Load ({press.value[0]:.2g}, {press.value[1]:.2g}, {press.value[2]:.2g})'
-            # define xobject
-            meta = self.stko.doc.metaDataCondition('Loads.Force.FaceForce')
-            xobj = MpcXObject.createInstanceOf(meta)
-            if press.local:
-                xobj.getAttribute('Orientation').string = 'Local'
-                xobj.getAttribute('Global').boolean = False
-            else:
-                xobj.getAttribute('Orientation').string = 'Global'
-                xobj.getAttribute('Global').boolean = True
-            xobj.getAttribute('F').quantityVector3.value = Math.vec3(*press.value[:3])
-            condition.XObject = xobj
-            # add the assigned elements to the condition
-            geom_ele_map : DefaultDict[MpcGeometry, List[int]] = defaultdict(list)
-            for i in ele_ids:
-                # get the geometry and subshape id
-                area_data = self._area_map.get(i, None)
-                if area_data is None:
-                    raise Exception(f'Area {i} not found in geometry')
-                geom_ele_map[area_data.geom].append(area_data.subshape_id)
-            for geom, faces in geom_ele_map.items():
-                sset = MpcConditionIndexedSubSet()
-                for ie in faces:
-                    sset.faces.append(ie)
-                condition.assignTo(geom, sset)
-            # add the condition to the document
-            self.stko.add_condition(condition)
-            condition.commitXObjectChanges()
-            # track the load id for the load pattern
-            self._pattern_load_ids[lc.name].append(condition.id)
-
-    # builds the floor loads in STKO
-    def _build_floor_loads(self, lc:load_case):
-        # build floor load as NodeForce (not Moments)
-        for floor_load, node_ids in lc.floor_loads.items():
-            # create a new condition
-            condition = MpcCondition()
-            condition.id = self.stko.new_condition_id()
-            condition.name = f'Floor Load ({floor_load.value[0]:.2g}, {floor_load.value[1]:.2g}, {floor_load.value[2]:.2g})'
-            # define xobject
-            meta = self.stko.doc.metaDataCondition('Loads.Force.NodeForce')
-            xobj = MpcXObject.createInstanceOf(meta)
-            xobj.getAttribute('F').quantityVector3.value = Math.vec3(*floor_load.value)
-            condition.XObject = xobj
-            # add the assigned nodes to the condition
-            geom_node_map : DefaultDict[MpcGeometry, List[int]] = defaultdict(list)
-            for i in node_ids:
-                # get the geometry and subshape id
-                vertex_data = self._vertex_map.get(i, None)
-                if vertex_data is None:
-                    raise Exception(f'Vertex {i} not found in geometry')
-                geom_node_map[vertex_data.geom].append(vertex_data.subshape_id)
-            for geom, vertices in geom_node_map.items():
-                sset = MpcConditionIndexedSubSet()
-                for iv in vertices:
-                    sset.vertices.append(iv)
-                condition.assignTo(geom, sset)
-            # add the condition to the document
-            self.stko.add_condition(condition)
-            condition.commitXObjectChanges()
-            # track the load id for the load pattern
-            self._pattern_load_ids[lc.name].append(condition.id)
 
     # builds the load cases in STKO
     def _build_load_cases(self):
